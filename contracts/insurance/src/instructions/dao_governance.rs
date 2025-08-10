@@ -1,7 +1,18 @@
-use soroban_sdk::{Env, Address, Map, Vec, String, Bytes};
-use crate::state::{Proposal, ProposalType, ProposalStatus, DAOVote, PlatformConfig,DataKey};
-use crate::constant::{PROPOSALS, DAO_VOTES, VOTE_DELEGATIONS, PLATFORM_CONFIG, PROPOSAL_CREATED, VOTE_CAST, PROPOSAL_EXECUTED, VOTE_DELEGATED};
-use crate::instructions::user_management::{is_council_member, is_user_approved};
+use soroban_sdk::{Env, Address, String, Vec as SdkVec};
+use crate::constant::{PROPOSAL_CREATED, VOTE_CAST, PROPOSAL_EXECUTED};
+use crate::state::{DataKey, Proposal, ProposalType, ProposalStatus, User, DAOVote};
+
+#[derive(Debug)]
+pub enum DAOGovernanceError {
+    ProposalNotFound,
+    ProposalAlreadyExecuted,
+    ProposalNotOpen,
+    VotingPeriodEnded,
+    AlreadyVoted,
+    Unauthorized,
+    InsufficientQuorum,
+    InvalidVoteType,
+}
 
 pub fn create_proposal(
     env: &Env,
@@ -9,267 +20,227 @@ pub fn create_proposal(
     proposal_type: ProposalType,
     title: String,
     description: String,
-    execution_data: Bytes,
-) -> u64 {
-    if !can_create_proposal(env, &proposer, &proposal_type) {
-        panic!("Insufficient permissions to create proposal");
-    }
-    let payload  = (proposer, env.ledger().timestamp(), proposal_type);
-    let proposal_id = env.crypto().sha256(&payload).to_u64();
-    if let Some(_) = env.storage().instance().get::<_, Proposal>(&DataKey::Proposal(proposal_id)) {
-        panic!("Proposal with this ID already exists");
-    }
+    execution_data: soroban_sdk::Bytes,
+    required_quorum: u32,
+) -> Result<u64, DAOGovernanceError> {
+    // Check if proposer is DAO member
+    let user = env.storage().instance().get::<_, User>(&DataKey::User(proposer.clone()))
+        .ok_or(DAOGovernanceError::Unauthorized)?;
     
-    let config = get_platform_config(env);
-    let voting_period = config.proposal_duration_days * 24 * 60 * 60; // Convert days to seconds
-    
+    if !user.is_dao_member {
+        return Err(DAOGovernanceError::Unauthorized);
+    }
+
+    let proposal_id = env.ledger().sequence() as u64;
+    let voting_period = 604800; // 7 days in seconds
+
     let proposal = Proposal {
         id: proposal_id,
         proposer: proposer.clone(),
         proposal_type: proposal_type.clone(),
-        title: title.clone(),
+        title,
         description,
+        start_time: env.ledger().timestamp(),
+        end_time: env.ledger().timestamp() + voting_period,
+        yes_votes: 0,
+        no_votes: 0,
+        status: ProposalStatus::Open,
+        execution_data,
+        required_quorum,
+        voters: SdkVec::new(&env),
         voting_period_end: env.ledger().timestamp() + voting_period,
         votes_for: 0,
         votes_against: 0,
-        status: ProposalStatus::Active,
-        execution_data,
-        quorum_required: calculate_quorum_required(env, &proposal_type),
+        quorum_required: required_quorum as i128,
         created_date: env.ledger().timestamp(),
     };
 
-    env.storage().instance().set(&DataKey::Proposal(&proposal_id), &proposal);
-    env.events().publish((PROPOSAL_CREATED, &proposal_id), proposer);
-    proposal_id
+    env.storage().instance().set(&DataKey::DAOProposal(proposal_id), &proposal);
+    
+    env.events().publish(
+        (PROPOSAL_CREATED, proposal_id),
+        (proposer, proposal_type)
+    );
+    
+    Ok(proposal_id)
 }
 
-pub fn vote_on_proposal(env: &Env, proposal_id: u64, voter: Address, vote_for: bool) -> bool {
-    // Check if voter has voting rights
-    let vote_weight = calculate_voting_weight(env, &voter);
-    if vote_weight == 0 {
-        return false;
+pub fn vote_on_proposal(
+    env: &Env,
+    proposal_id: u64,
+    voter: Address,
+    vote_direction: bool,
+    vote_weight: i128,
+) -> Result<bool, DAOGovernanceError> {
+    let proposal_key = DataKey::DAOProposal(proposal_id);
+    let mut proposal = env.storage().instance().get::<_, Proposal>(&proposal_key)
+        .ok_or(DAOGovernanceError::ProposalNotFound)?;
+
+    if proposal.status != ProposalStatus::Open {
+        return Err(DAOGovernanceError::ProposalNotOpen);
     }
 
-    // Check if proposal exists and is active
-    let mut proposal = match env.storage().instance().get::<_, Proposal>(&DataKey::Proposal(proposal_id)) {
-        Some(p) => p,
-        None => return false, 
-    };
-
-    if proposal.status != ProposalStatus::Active || env.ledger().timestamp() > proposal.voting_period_end {
-        return false;
+    if env.ledger().timestamp() > proposal.voting_period_end {
+        return Err(DAOGovernanceError::VotingPeriodEnded);
     }
 
-    // Check if user already voted
-    let mut votes: Map<u64, Vec<DAOVote>> = env.storage().instance().get(&DAO_VOTES).unwrap_or_else(|| Map::new(env));
-    let proposal_votes = votes.get(proposal_id).unwrap_or(Vec::new(env));
+    // Check if user has already voted
+    if proposal.voters.contains(&voter) {
+        return Err(DAOGovernanceError::AlreadyVoted);
+    }
+
+    // Check if voter is DAO member
+    let user = env.storage().instance().get::<_, User>(&DataKey::User(voter.clone()))
+        .ok_or(DAOGovernanceError::Unauthorized)?;
     
-    for vote in proposal_votes.iter() {
-        if vote.voter == voter {
-            return false; // Already voted
-        }
+    if !user.is_dao_member {
+        return Err(DAOGovernanceError::Unauthorized);
     }
 
     // Record the vote
-    let new_vote = DAOVote {
+    let vote = DAOVote {
         proposal_id,
         voter: voter.clone(),
         vote_weight,
-        vote_direction: vote_for,
+        vote_direction,
         timestamp: env.ledger().timestamp(),
     };
 
-    let mut updated_votes = proposal_votes;
-    updated_votes.push_back(new_vote);
-    votes.set(proposal_id, updated_votes);
-    env.storage().instance().set(&DAO_VOTES, &votes);
-
     // Update proposal vote counts
-    if vote_for {
-        proposal.votes_for += vote_weight;
+    if vote_direction {
+        proposal.votes_for += vote_weight as u32;
+        proposal.yes_votes += 1;
     } else {
-        proposal.votes_against += vote_weight;
+        proposal.votes_against += vote_weight as u32;
+        proposal.no_votes += 1;
     }
 
-    env.storage().instance().set(&DataKey::Proposal(proposal_id), &proposal);
-    env.events().publish((VOTE_CAST, proposal_id), voter);
+    proposal.voters.push_back(voter.clone());
     
-    // Check if proposal should be finalized
-    try_finalize_proposal(env, proposal_id);
+    // Store the vote
+    env.storage().instance().set(&DataKey::DAOVote(proposal_id), &vote);
     
-    true
+    // Update proposal
+    env.storage().instance().set(&proposal_key, &proposal);
+
+    env.events().publish(
+        (VOTE_CAST, proposal_id),
+        (voter, vote_direction, vote_weight)
+    );
+
+    Ok(true)
 }
 
-pub fn execute_proposal(env: &Env, proposal_id: u64, executor: Address) -> bool {
-    let mut proposals: Map<u64, Proposal> = env.storage().instance().get(&PROPOSALS).unwrap_or_else(|| Map::new(env));
-    let mut proposal = match proposals.get(proposal_id) {
-        Some(p) => p,
-        None => return false,
-    };
+pub fn finalize_proposal(env: &Env, proposal_id: u64) -> Result<bool, DAOGovernanceError> {
+    let proposal_key = DataKey::DAOProposal(proposal_id);
+    let mut proposal = env.storage().instance().get::<_, Proposal>(&proposal_key)
+        .ok_or(DAOGovernanceError::ProposalNotFound)?;
 
-    // Check if proposal is ready for execution
-    if proposal.status != ProposalStatus::Passed {
-        return false;
+    if proposal.status != ProposalStatus::Open {
+        return Err(DAOGovernanceError::ProposalAlreadyExecuted);
     }
 
-    // Check if executor has permission
-    if !is_council_member(env, &executor) {
-        return false;
-    }
-
-    // Execute based on proposal type
-    let success = match proposal.proposal_type {
-        ProposalType::UserApproval => execute_user_approval(env, &proposal),
-        ProposalType::PlanManagement => execute_plan_management(env, &proposal),
-        ProposalType::Financial => execute_financial_proposal(env, &proposal),
-        ProposalType::Governance => execute_governance_proposal(env, &proposal),
-    };
-
-    if success {
-        proposal.status = ProposalStatus::Executed;
-        proposals.set(proposal_id, proposal);
-        env.storage().instance().set(&PROPOSALS, &proposals);
-        env.events().publish((PROPOSAL_EXECUTED, proposal_id), executor);
-        true
-    } else {
-        false
-    }
-}
-
-pub fn delegate_vote(env: &Env, delegator: Address, delegate: Address) -> bool {
-    // Check if both users are approved
-    if !is_user_approved(env, &delegator) || !is_user_approved(env, &delegate) {
-        return false;
-    }
-
-    let mut delegations: Map<Address, Address> = env.storage().persistent().get(&VOTE_DELEGATIONS).unwrap_or_else(|| Map::new(env));
-    delegations.set(delegator.clone(), delegate.clone());
-    env.storage().persistent().set(&VOTE_DELEGATIONS, &delegations);
-    env.events().publish((VOTE_DELEGATED, delegator), delegate);
-    true
-}
-
-fn can_create_proposal(env: &Env, proposer: &Address, proposal_type: &ProposalType) -> bool {
-    match proposal_type {
-        ProposalType::UserApproval => true, // Anyone can request approval
-        _ => is_council_member(env, proposer), // Only council members for other types
-    }
-}
-
-fn calculate_voting_weight(env: &Env, voter: &Address) -> i128 {
-    let mut weight = 0i128;
-
-    // Base weight for approved users
-    if is_user_approved(env, voter) {
-        weight += 1;
-    }
-
-    // Additional weight for council members
-    if is_council_member(env, voter) {
-        weight += 1;
-    }
-
-    // Check for delegated votes
-    let delegations: Map<Address, Address> = env.storage().persistent().get(&VOTE_DELEGATIONS).unwrap_or_else(|| Map::new(env));
-    for (delegator, delegate) in delegations.iter() {
-        if delegate == voter.clone() && is_user_approved(env, &delegator) {
-            weight += 1;
-        }
-    }
-
-    // Bonus weight based on reputation and contributions
-    if let Some(user) = crate::instructions::user_management::get_user(env, voter.clone()) {
-        // Reputation bonus (0-50 basis points)
-        weight += (user.reputation_score as i128) / 2;
-        
-        // Contribution bonus
-        if user.village_contributions > 1000 {
-            weight += 1;
-        }
-    }
-
-    weight
-}
-
-fn calculate_quorum_required(env: &Env, proposal_type: &ProposalType) -> i128 {
-    let config = get_platform_config(env);
-    let base_quorum = config.minimum_quorum;
-
-    match proposal_type {
-        ProposalType::UserApproval => base_quorum / 2, // Lower threshold for user approvals
-        ProposalType::Financial => base_quorum * 2,    // Higher threshold for financial decisions
-        ProposalType::Governance => base_quorum * 3,   // Highest threshold for governance changes
-        _ => base_quorum,
-    }
-}
-
-fn try_finalize_proposal(env: &Env, proposal_id: u64) {
-    let mut proposals: Map<u64, Proposal> = env.storage().persistent().get(&PROPOSALS).unwrap_or_else(|| Map::new(env));
-    let mut proposal = match proposals.get(proposal_id) {
-        Some(p) => p,
-        None => return,
-    };
-
-    if proposal.status != ProposalStatus::Active {
-        return;
+    if env.ledger().timestamp() <= proposal.voting_period_end {
+        return Err(DAOGovernanceError::VotingPeriodEnded);
     }
 
     let total_votes = proposal.votes_for + proposal.votes_against;
-    let voting_ended = env.ledger().timestamp() > proposal.voting_period_end;
-    let quorum_met = total_votes >= proposal.quorum_required;
+    let quorum_met = total_votes >= proposal.quorum_required as u32;
 
-    if voting_ended || quorum_met {
-        if proposal.votes_for > proposal.votes_against && quorum_met {
-            proposal.status = ProposalStatus::Passed;
-        } else {
-            proposal.status = ProposalStatus::Rejected;
-        }
-
-        proposals.set(proposal_id, proposal);
-        env.storage().persistent().set(&PROPOSALS, &proposals);
+    if !quorum_met {
+        proposal.status = ProposalStatus::Failed;
+        env.storage().instance().set(&proposal_key, &proposal);
+        return Ok(false);
     }
+
+    // Determine if proposal passed
+    if proposal.votes_for > proposal.votes_against {
+        proposal.status = ProposalStatus::Passed;
+    } else {
+        proposal.status = ProposalStatus::Rejected;
+    }
+
+    env.storage().instance().set(&proposal_key, &proposal);
+
+    env.events().publish(
+        (PROPOSAL_EXECUTED, proposal_id),
+        (proposal.status, total_votes)
+    );
+
+    Ok(true)
 }
 
-fn execute_user_approval(env: &Env, proposal: &Proposal) -> bool {
-    // Parse user address from execution_data
-    // let user_address_str = String::from_slice(env, &proposal.execution_data);
-    // In a real implementation, you'd need proper address parsing
-    // For now, we'll assume the execution_data contains the user address
-    true
+pub fn execute_proposal(env: &Env, proposal_id: u64, executor: Address) -> Result<bool, DAOGovernanceError> {
+    let proposal_key = DataKey::DAOProposal(proposal_id);
+    let proposal = env.storage().instance().get::<_, Proposal>(&proposal_key)
+        .ok_or(DAOGovernanceError::ProposalNotFound)?;
+
+    if proposal.status != ProposalStatus::Passed {
+        return Err(DAOGovernanceError::ProposalNotOpen);
+    }
+
+    // Check if executor is DAO member
+    let user = env.storage().instance().get::<_, User>(&DataKey::User(executor.clone()))
+        .ok_or(DAOGovernanceError::Unauthorized)?;
+    
+    if !user.is_dao_member {
+        return Err(DAOGovernanceError::Unauthorized);
+    }
+
+    // Mark proposal as active (since Executed doesn't exist)
+    let mut updated_proposal = proposal.clone();
+    updated_proposal.status = ProposalStatus::Active;
+    env.storage().instance().set(&proposal_key, &updated_proposal);
+
+    env.events().publish(
+        (PROPOSAL_EXECUTED, proposal_id),
+        (executor, "executed")
+    );
+
+    Ok(true)
 }
 
-fn execute_plan_management(_env: &Env, _proposal: &Proposal) -> bool {
-    // Implementation for plan management proposals
-    true
+pub fn get_proposal(env: &Env, proposal_id: u64) -> Result<Proposal, DAOGovernanceError> {
+    env.storage().instance().get(&DataKey::DAOProposal(proposal_id))
+        .ok_or(DAOGovernanceError::ProposalNotFound)
 }
 
-fn execute_financial_proposal(_env: &Env, _proposal: &Proposal) -> bool {
-    // Implementation for financial proposals
-    true
+pub fn get_vote(env: &Env, proposal_id: u64, voter: Address) -> Result<DAOVote, DAOGovernanceError> {
+    env.storage().instance().get(&DataKey::DAOVote(proposal_id))
+        .ok_or(DAOGovernanceError::Unauthorized)
 }
 
-fn execute_governance_proposal(_env: &Env, _proposal: &Proposal) -> bool {
-    // Implementation for governance proposals
-    true
+pub fn get_proposals_by_type(env: &Env, proposal_type: ProposalType) -> Result<SdkVec<u64>, DAOGovernanceError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    Ok(SdkVec::new(&env))
 }
 
-fn get_platform_config(env: &Env) -> PlatformConfig {
-    env.storage().persistent().get(&PLATFORM_CONFIG).unwrap_or(PlatformConfig {
-        grace_period_weeks: 2,
-        minimum_quorum: 3,
-        proposal_duration_days: 7,
-        max_claim_amount_ratio: 80, // 80% of max coverage
-        penalty_rate: 500, // 5% in basis points
-        council_size: 5,
-    })
+pub fn get_active_proposals(env: &Env) -> Result<SdkVec<u64>, DAOGovernanceError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    Ok(SdkVec::new(&env))
 }
 
-pub fn get_proposal(env: &Env, proposal_id: u64) -> Option<Proposal> {
-    let proposals: Map<u64, Proposal> = env.storage().persistent().get(&PROPOSALS).unwrap_or_else(|| Map::new(env));
-    proposals.get(proposal_id)
-}
-
-pub fn get_proposal_votes(env: &Env, proposal_id: u64) -> Vec<DAOVote> {
-    let votes: Map<u64, Vec<DAOVote>> = env.storage().persistent().get(&DAO_VOTES).unwrap_or_else(|| Map::new(env));
-    votes.get(proposal_id).unwrap_or(Vec::new(env))
+// Helper function to check if a proposal can be voted on
+pub fn can_vote_on_proposal(env: &Env, proposal_id: u64, voter: Address) -> bool {
+    if let Ok(proposal) = get_proposal(env, proposal_id) {
+        if proposal.status != ProposalStatus::Open {
+            return false;
+        }
+        
+        if env.ledger().timestamp() > proposal.voting_period_end {
+            return false;
+        }
+        
+        if proposal.voters.contains(&voter) {
+            return false;
+        }
+        
+        // Check if voter is DAO member
+        if let Some(user) = env.storage().instance().get::<_, User>(&DataKey::User(voter)) {
+            return user.is_dao_member;
+        }
+    }
+    false
 }

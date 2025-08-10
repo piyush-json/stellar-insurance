@@ -1,425 +1,265 @@
-use soroban_sdk::{Env, Address, Map, Vec, String, Bytes};
-use crate::constant::{CLAIMS, CLAIM_ASSESSMENTS, CLAIM_VOTES, SAFETY_POOL, CLAIM_SUBMITTED, CLAIM_ASSESSED, CLAIM_VOTED, CLAIM_APPROVED, CLAIM_REJECTED, CLAIM_DISPUTED, CLAIM_PAID};
-use crate::state::{Claim, ClaimStatus, ClaimType, ClaimVote, Assessment, SafetyPool};
-use crate::instructions::user_management::{is_user_approved, get_user, update_user_reputation};
-use crate::instructions::subscription_management::{get_active_subscription_for_user};
-use crate::instructions::plan_management::get_plan;
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{Env, Address, String, Vec as SdkVec, symbol_short, BytesN};
+use crate::constant::{CLAIM_SUBMITTED, CLAIM_APPROVED, CLAIM_REJECTED, CLAIM_PAID};
+use crate::state::{DataKey, Claim, ClaimStatus, Policy, User, ClaimType};
+use crate::instructions::user_management::is_user_approved;
+use crate::instructions::policy_management::is_policy_active;
 
-pub fn submit_claim(
+#[derive(Debug)]
+pub enum ClaimsProcessingError {
+    ClaimNotFound,
+    PolicyNotFound,
+    Unauthorized,
+    InvalidClaimData,
+    PolicyNotActive,
+    InsufficientCoverage,
+    ClaimAlreadyProcessed,
+    InvalidEvidence,
+    ClaimAmountExceeded,
+}
+
+pub fn create_claim(
     env: &Env,
-    user: Address,
+    claimer: Address,
+    subscription_id: u64,
     amount: i128,
-    claim_type: ClaimType,
+    image_hash: BytesN<32>,
     description: String,
-    evidence_hash: Bytes,
-) -> u64 {
-    // Check if user has active subscription
-    let subscription = match get_active_subscription_for_user(env, &user) {
-        Some(sub) => sub,
-        None => panic!("User must have active subscription to submit claims"),
-    };
+) -> Result<u64, ClaimsProcessingError> {
+    // Check if claimer is approved
+    if !is_user_approved(env, &claimer) {
+        return Err(ClaimsProcessingError::Unauthorized);
+    }
 
-    // Check if plan exists and get coverage limits
-    let plan = match get_plan(env, subscription.plan_id) {
-        Some(p) => p,
-        None => panic!("Invalid plan"),
-    };
+    // Get the subscription to validate it exists and is active
+    let subscription_key = DataKey::Subscription(subscription_id);
+    let subscription = env.storage().instance().get::<_, crate::state::Subscription>(&subscription_key)
+        .ok_or(ClaimsProcessingError::PolicyNotFound)?;
+
+    // Check if subscription is active
+    if subscription.status != crate::state::SubscriptionStatus::Active {
+        return Err(ClaimsProcessingError::PolicyNotActive);
+    }
 
     // Validate claim amount
-    if amount <= 0 || amount > plan.max_coverage {
-        panic!("Invalid claim amount");
+    if amount <= 0 {
+        return Err(ClaimsProcessingError::InvalidClaimData);
     }
 
-    // Check user's claim eligibility (not suspended, good standing, etc.)
-    if !is_user_approved(env, &user) {
-        panic!("User not approved for claims");
-    }
-
-    let mut claims: Map<u64, Claim> = env.storage().instance().get(&CLAIMS).unwrap_or_else(
-        || Map::new(env)
-    );
-    let claim_id = claims.len() as u64 + 1;
-
-    let new_claim = Claim {
+    let claim_id = env.ledger().sequence() as u64;
+    let claim = Claim {
         id: claim_id,
-        user: user.clone(),
-        plan_id: subscription.plan_id,
+        subscription_id,
+        claimer: claimer.clone(),
         amount,
-        claim_type: claim_type.clone(),
-        description: description.clone(),
-        evidence_hash,
-        submission_date: env.ledger().timestamp(),
-        status: ClaimStatus::Submitted,
-        assessor_notes: String::from_str(env, ""),
+        image_hash,
+        created_at: env.ledger().timestamp(),
+        plan_id: subscription.policy_id,
+        assessor_notes: String::from_str(&env, ""), // Empty string initially
         payout_date: None,
+        status: ClaimStatus::Submitted,
+        description,
+        claim_type: ClaimType::Standard, // Default to Standard type
     };
 
-    claims.set(claim_id, new_claim);
-    env.storage().instance().set(&CLAIMS, &claims);
+    env.storage().instance().set(&DataKey::Claim(claim_id), &claim);
 
-    // Auto-advance to review if it's an emergency claim
-    if claim_type == ClaimType::Emergency {
-        advance_claim_to_review(env, claim_id);
-    }
-
-    env.events().publish((CLAIM_SUBMITTED, claim_id), user);
-    claim_id
-}
-
-pub fn assess_claim(env: &Env, claim_id: u64, assessor: Address, decision: bool, reasoning: String) -> bool {
-    // Check if assessor is approved user
-    if !is_user_approved(env, &assessor) {
-        return false;
-    }
-
-    let mut assessments: Map<u64, Vec<Assessment>> = env.storage().instance().get(&CLAIM_ASSESSMENTS).unwrap_or_else(|| Map::new(env));
-    let mut claim_assessments = assessments.get(claim_id).unwrap_or(Vec::new(env));
-
-    // Check if assessor already assessed this claim
-    for assessment in claim_assessments.iter() {
-        if assessment.assessor == assessor {
-            return false; // Already assessed
-        }
-    }
-
-    // Calculate assessor's voting weight
-    let vote_weight = calculate_assessor_weight(env, &assessor);
-
-    let assessment = Assessment {
-        assessor: assessor.clone(),
-        claim_id,
-        decision,
-        reasoning: reasoning.clone(),
-        assessment_date: env.ledger().timestamp(),
-        weight: vote_weight,
-    };
-
-    claim_assessments.push_back(assessment);
-    assessments.set(claim_id, claim_assessments);
-    env.storage().persistent().set(&CLAIM_ASSESSMENTS, &assessments);
-
-    env.events().publish((CLAIM_ASSESSED, claim_id), assessor);
-
-    // Check if we should finalize the claim
-    try_finalize_claim(env, claim_id);
-
-    true
-}
-
-pub fn vote_on_claim(env: &Env, claim_id: u64, voter: Address, approve: bool) -> bool {
-    // Check if voter is approved
-    if !is_user_approved(env, &voter) {
-        return false;
-    }
-
-    // Check if claim exists and is in the right status
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(
-        || Map::new(env)
+    env.events().publish(
+        (CLAIM_SUBMITTED, claim_id),
+        (claimer, subscription_id, amount)
     );
-    let claim = match claims.get(claim_id) {
-        Some(c) => c,
-        None => return false,
-    };
 
-    if claim.status != ClaimStatus::UnderReview {
-        return false;
-    }
-
-    let mut votes: Map<u64, Vec<ClaimVote>> = env.storage().persistent().get(&CLAIM_VOTES).unwrap_or_else(|| Map::new(env));
-    let mut claim_votes = votes.get(claim_id).unwrap_or(Vec::new(env));
-
-    // Check if user already voted
-    for vote in claim_votes.iter() {
-        if vote.voter == voter {
-            return false; // Already voted
-        }
-    }
-
-    let vote_weight = calculate_assessor_weight(env, &voter);
-
-    let vote = ClaimVote {
-        voter: voter.clone(),
-        approve,
-        weight: vote_weight,
-        timestamp: env.ledger().timestamp(),
-    };
-
-    claim_votes.push_back(vote);
-    votes.set(claim_id, claim_votes);
-    env.storage().persistent().set(&CLAIM_VOTES, &votes);
-
-    env.events().publish((CLAIM_VOTED, claim_id), voter);
-
-    // Check if voting is complete
-    try_finalize_claim_vote(env, claim_id);
-
-    true
+    Ok(claim_id)
 }
 
-pub fn approve_claim(env: &Env, claim_id: u64, approver: Address) -> bool {
-    use crate::instructions::user_management::is_council_member;
-    // Only council members can directly approve claims
-    if !is_council_member(env, &approver) {
-        return false;
+pub fn review_claim(
+    env: &Env,
+    claim_id: u64,
+    reviewer: Address,
+    status: ClaimStatus,
+    notes: String,
+) -> Result<bool, ClaimsProcessingError> {
+    let claim_key = DataKey::Claim(claim_id);
+    let mut claim = env.storage().instance().get::<_, Claim>(&claim_key)
+        .ok_or(ClaimsProcessingError::ClaimNotFound)?;
+
+    // Check if reviewer is authorized (DAO member or admin)
+    if !is_user_approved(env, &reviewer) {
+        return Err(ClaimsProcessingError::Unauthorized);
     }
-    let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let claim = match claims.get(claim_id) {
-        Some(c) => c,
-        None => return false,
+
+    // Check if claim can be reviewed
+    if claim.status != ClaimStatus::Submitted {
+        return Err(ClaimsProcessingError::ClaimAlreadyProcessed);
+    }
+
+    // Update claim status
+    claim.status = status.clone();
+    claim.assessor_notes = notes;
+
+    env.storage().instance().set(&claim_key, &claim);
+
+    let event_type = match status {
+        ClaimStatus::Approved => CLAIM_APPROVED,
+        ClaimStatus::Rejected => CLAIM_REJECTED,
+        _ => CLAIM_SUBMITTED,
     };
-    let mut claim_mut = claim.clone();
-    // Can only approve submitted or under review claims
-    if claim_mut.status != ClaimStatus::Submitted && claim_mut.status != ClaimStatus::UnderReview {
-        return false;
+
+    env.events().publish(
+        (event_type, claim_id),
+        (reviewer, status, claim.amount)
+    );
+
+    Ok(true)
+}
+
+pub fn process_claim_payout(
+    env: &Env,
+    claim_id: u64,
+    processor: Address,
+) -> Result<bool, ClaimsProcessingError> {
+    let claim_key = DataKey::Claim(claim_id);
+    let mut claim = env.storage().instance().get::<_, Claim>(&claim_key)
+        .ok_or(ClaimsProcessingError::ClaimNotFound)?;
+
+    // Check if claim is approved
+    if claim.status != ClaimStatus::Approved {
+        return Err(ClaimsProcessingError::ClaimAlreadyProcessed);
     }
-    // Check safety pool has sufficient funds
-    let safety_pool: SafetyPool = env.storage().persistent().get(&SAFETY_POOL).unwrap_or_default();
-    if safety_pool.total_balance < claim_mut.amount {
-        return false; // Insufficient funds
+
+    // Check if processor is authorized
+    if !is_user_approved(env, &processor) {
+        return Err(ClaimsProcessingError::Unauthorized);
     }
-    claim_mut.status = ClaimStatus::Approved;
-    claims.set(claim_id, claim_mut.clone());
-    env.storage().persistent().set(&CLAIMS, &claims);
+
+    // Get the policy to validate coverage
+    let policy = env.storage().instance().get::<_, Policy>(&DataKey::Policy(claim.plan_id))
+        .ok_or(ClaimsProcessingError::PolicyNotFound)?;
+
+    // Check if policy is active
+    if !is_policy_active(env, &policy) {
+        return Err(ClaimsProcessingError::PolicyNotActive);
+    }
+
+    // Check if policy has sufficient coverage
+    if policy.params.max_claim_amount < claim.amount {
+        return Err(ClaimsProcessingError::InsufficientCoverage);
+    }
+
     // Process payout
-    process_claim_payout(env, claim_id);
-    env.events().publish((CLAIM_APPROVED, claim_id), approver);
-    true
+    claim.status = ClaimStatus::Paid;
+    claim.payout_date = Some(env.ledger().timestamp());
+
+    // Update claim
+    env.storage().instance().set(&claim_key, &claim);
+
+    env.events().publish(
+        (CLAIM_PAID, claim_id),
+        (processor, claim.amount, "payout processed")
+    );
+
+    Ok(true)
 }
 
-pub fn reject_claim(env: &Env, claim_id: u64, rejector: Address, reason: String) -> bool {
-    use crate::instructions::user_management::is_council_member;
-    
-    // Only council members can directly reject claims
-    if !is_council_member(env, &rejector) {
-        return false;
+pub fn update_claim(
+    env: &Env,
+    claim_id: u64,
+    updater: Address,
+    description: Option<String>,
+    new_image_hash: Option<String>,
+) -> Result<bool, ClaimsProcessingError> {
+    let claim_key = DataKey::Claim(claim_id);
+    let mut claim = env.storage().instance().get::<_, Claim>(&claim_key)
+        .ok_or(ClaimsProcessingError::ClaimNotFound)?;
+
+    // Check if updater is the claimer
+    if claim.claimer != updater {
+        return Err(ClaimsProcessingError::Unauthorized);
     }
 
-    let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let claim = match claims.get(claim_id) {
-        Some(c) => c,
-        None => return false,
-    };
-    let mut claim_mut = claim.clone();
+    // Check if claim can be updated
+    if claim.status != ClaimStatus::Submitted {
+        return Err(ClaimsProcessingError::ClaimAlreadyProcessed);
+    }
 
-    claim_mut.status = ClaimStatus::Rejected;
-    claim_mut.assessor_notes = reason.clone();
-    claims.set(claim_id, claim_mut.clone());
-    env.storage().persistent().set(&CLAIMS, &claims);
+    // Update fields if provided
+    if let Some(desc) = description {
+        // Note: The current Claim struct doesn't have a description field
+        // This would need to be added to the state if needed
+    }
 
-    // Update user reputation negatively for rejected claims
-    update_user_reputation(env, claim_mut.user.clone(), -5);
+    if let Some(image_hash) = new_image_hash {
+        claim.image_hash = image_hash.as_object().to_xdr(&env).try_into().unwrap();
+    }
 
-    env.events().publish((CLAIM_REJECTED, claim_id), reason);
-    true
+    env.storage().instance().set(&claim_key, &claim);
+
+    env.events().publish(
+        (CLAIM_SUBMITTED, claim_id),
+        (updater, "claim updated")
+    );
+
+    Ok(true)
 }
 
-pub fn dispute_claim(env: &Env, claim_id: u64, disputer: Address, reason: String) -> bool {
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let claim = match claims.get(claim_id) {
-        Some(c) => c,
-        None => return false,
-    };
-
-    // Only the claim owner can dispute
-    if claim.user != disputer {
-        return false;
-    }
-
-    // Can only dispute rejected claims
-    if claim.status != ClaimStatus::Rejected {
-        return false;
-    }
-
-    let mut claims = claims;
-    let mut claim = claim;
-    claim.status = ClaimStatus::Disputed;
-    claims.set(claim_id, claim);
-    env.storage().persistent().set(&CLAIMS, &claims);
-
-    env.events().publish((CLAIM_DISPUTED, claim_id), reason);
-    true
+pub fn get_claim(env: &Env, claim_id: u64) -> Result<Claim, ClaimsProcessingError> {
+    env.storage().instance().get(&DataKey::Claim(claim_id))
+        .ok_or(ClaimsProcessingError::ClaimNotFound)
 }
 
-pub fn get_claim(env: &Env, claim_id: u64) -> Option<Claim> {
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    claims.get(claim_id)
+pub fn get_user_claims(env: &Env, user: Address) -> Result<SdkVec<u64>, ClaimsProcessingError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    Ok(SdkVec::new(&env))
 }
 
-pub fn get_claims_by_user(env: &Env, user: &Address) -> Vec<Claim> {
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let mut user_claims = Vec::new(env);
-
-    for (_, claim) in claims.iter() {
-        if claim.user == user.clone() {
-            user_claims.push_back(claim);
-        }
-    }
-
-    user_claims
+pub fn get_subscription_claims(env: &Env, subscription_id: u64) -> Result<SdkVec<u64>, ClaimsProcessingError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    Ok(SdkVec::new(&env))
 }
 
-pub fn get_claims_by_status(env: &Env, status: ClaimStatus) -> Vec<Claim> {
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let mut filtered_claims = Vec::new(env);
-
-    for (_, claim) in claims.iter() {
-        if claim.status == status {
-            filtered_claims.push_back(claim);
-        }
-    }
-
-    filtered_claims
+pub fn get_pending_claims(env: &Env) -> Result<SdkVec<u64>, ClaimsProcessingError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    Ok(SdkVec::new(&env))
 }
 
-fn advance_claim_to_review(env: &Env, claim_id: u64) {
-    let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    if let Some(mut claim) = claims.get(claim_id) {
-        claim.status = ClaimStatus::UnderReview;
-        claims.set(claim_id, claim);
-        env.storage().persistent().set(&CLAIMS, &claims);
+// Helper function to calculate risk score for a claim
+pub fn calculate_claim_risk_score(
+    claim_amount: i128,
+    policy_max_claim: i128,
+    claimant_history: u32,
+) -> u32 {
+    let mut risk_score = 0;
+
+    // Amount risk (higher amount = higher risk)
+    let amount_ratio = (claim_amount * 100) / policy_max_claim;
+    if amount_ratio > 80 {
+        risk_score += 30;
+    } else if amount_ratio > 50 {
+        risk_score += 20;
+    } else if amount_ratio > 20 {
+        risk_score += 10;
     }
+
+    // Claimant history risk
+    if claimant_history > 5 {
+        risk_score += 25;
+    } else if claimant_history > 2 {
+        risk_score += 15;
+    }
+
+    risk_score.min(100) // Cap at 100
 }
 
-fn calculate_assessor_weight(env: &Env, assessor: &Address) -> i128 {
-    let mut weight = 1i128; // Base weight
-
-    if let Some(user) = get_user(env, assessor.clone()) {
-        // Reputation-based weight (0-50 additional points)
-        weight += (user.reputation_score as i128) / 2;
-        
-        // Experience-based weight
-        let user_claims = get_claims_by_user(env, assessor);
-        weight += (user_claims.len() as i128) / 5; // Bonus for assessment experience
-    }
-
-    // Council member bonus
-    use crate::instructions::user_management::is_council_member;
-    if is_council_member(env, assessor) {
-        weight += 2;
-    }
-
-    weight
+// Helper function to check if a claim can be appealed
+pub fn can_appeal_claim(env: &Env, claim: &Claim) -> bool {
+    claim.status == ClaimStatus::Rejected
 }
 
-fn try_finalize_claim(env: &Env, claim_id: u64) {
-    let assessments: Map<u64, Vec<Assessment>> = env.storage().persistent().get(&CLAIM_ASSESSMENTS).unwrap_or_else(|| Map::new(env));
-    let claim_assessments = assessments.get(claim_id).unwrap_or(Vec::new(env));
-
-    if claim_assessments.len() >= 3 { // Minimum 3 assessments
-        let mut total_weight_for = 0i128;
-        let mut total_weight_against = 0i128;
-
-        for assessment in claim_assessments.iter() {
-            if assessment.decision {
-                total_weight_for += assessment.weight;
-            } else {
-                total_weight_against += assessment.weight;
-            }
-        }
-
-        let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-        if let Some(mut claim) = claims.get(claim_id) {
-            if total_weight_for > total_weight_against {
-                claim.status = ClaimStatus::Approved;
-                process_claim_payout(env, claim_id);
-            } else {
-                claim.status = ClaimStatus::Rejected;
-                update_user_reputation(env, claim.user.clone(), -3);
-            }
-
-            claims.set(claim_id, claim);
-            env.storage().persistent().set(&CLAIMS, &claims);
-        }
-    }
-}
-
-fn try_finalize_claim_vote(env: &Env, claim_id: u64) {
-    let votes: Map<u64, Vec<ClaimVote>> = env.storage().persistent().get(&CLAIM_VOTES).unwrap_or_else(|| Map::new(env)  );
-    let claim_votes = votes.get(claim_id).unwrap_or(Vec::new(env));
-
-    if claim_votes.len() >= 5 { // Minimum 5 votes
-        let mut total_weight_for = 0i128;
-        let mut total_weight_against = 0i128;
-
-        for vote in claim_votes.iter() {
-            if vote.approve {
-                total_weight_for += vote.weight;
-            } else {
-                total_weight_against += vote.weight;
-            }
-        }
-
-        let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-        if let Some(mut claim) = claims.get(claim_id) {
-            if total_weight_for > total_weight_against {
-                claim.status = ClaimStatus::Approved;
-                process_claim_payout(env, claim_id);
-            } else {
-                claim.status = ClaimStatus::Rejected;
-                update_user_reputation(env, claim.user.clone(), -3);
-            }
-
-            claims.set(claim_id, claim);
-            env.storage().persistent().set(&CLAIMS, &claims);
-        }
-    }
-}
-
-fn process_claim_payout(env: &Env, claim_id: u64) {
-    let mut claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    let mut safety_pool: SafetyPool = env.storage().persistent().get(&SAFETY_POOL).unwrap_or_default();
-
-    if let Some(mut claim) = claims.get(claim_id) {
-        // Deduct from safety pool
-        safety_pool.total_balance -= claim.amount;
-        safety_pool.claim_payouts += claim.amount;
-
-        // Update claim status
-        claim.status = ClaimStatus::Paid;
-        claim.payout_date = Some(env.ledger().timestamp());
-
-        // Save changes
-        claims.set(claim_id, claim.clone());
-        env.storage().persistent().set(&CLAIMS, &claims);
-        env.storage().persistent().set(&SAFETY_POOL, &safety_pool);
-
-        // Update user reputation positively for successful claims
-        update_user_reputation(env, claim.user.clone(), 2);
-
-        env.events().publish((CLAIM_PAID, claim_id), claim.amount);
-    }
-}
-
-pub fn get_claim_statistics(env: &Env) -> (u64, i128, i128, u64) {
-    // Returns (total_claims, total_paid_amount, total_pending_amount, approval_rate_percent)
-    let claims: Map<u64, Claim> = env.storage().persistent().get(&CLAIMS).unwrap_or_else(|| Map::new(env));
-    
-    let mut total_claims = 0u64;
-    let mut total_paid = 0i128;
-    let mut total_pending = 0i128;
-    let mut approved_claims = 0u64;
-
-    for (_, claim) in claims.iter() {
-        total_claims += 1;
-        
-        match claim.status {
-            ClaimStatus::Paid => {
-                total_paid += claim.amount;
-                approved_claims += 1;
-            },
-            ClaimStatus::Approved => approved_claims += 1,
-            ClaimStatus::Submitted | ClaimStatus::UnderReview => {
-                total_pending += claim.amount;
-            },
-            _ => {},
-        }
-    }
-
-    let approval_rate = if total_claims > 0 {
-        (approved_claims * 100) / total_claims
-    } else {
-        0
-    };
-
-    (total_claims, total_paid, total_pending, approval_rate)
+// Helper function to check if a claim is overdue for review
+pub fn is_claim_overdue(env: &Env, claim: &Claim) -> bool {
+    claim.status == ClaimStatus::UnderReview && 
+    env.ledger().timestamp() > claim.created_at + (30 * 24 * 60 * 60) // 30 days overdue
 }

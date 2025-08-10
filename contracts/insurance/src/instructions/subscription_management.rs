@@ -1,334 +1,292 @@
-use soroban_sdk::{Env, Address, Map, Vec};
-use crate::state::{Subscription, SubscriptionStatus, Payment, User, PlatformConfig};
-use crate::instructions::user_management::{is_user_approved};
-use crate::instructions::plan_management::{get_plan, is_plan_available_for_subscription, increment_plan_subscriber_count, decrement_plan_subscriber_count};
-use crate::constant::*;
+use soroban_sdk::{Env, Address,  Vec};
+use crate::constant::{EVENT_SUB_CRT, EVENT_SUB_PAY, EVENT_SUB_SUS};
+use crate::state::{DataKey, Subscription, SubscriptionStatus, Policy};
+use crate::instructions::user_management::is_user_approved;
 
-pub fn subscribe_to_plan(env: &Env, user: Address, plan_id: u64) -> bool {
-    // Check if user is approved
-    if !is_user_approved(env, &user) {
-        return false;
+#[derive(Debug)]
+pub enum SubscriptionManagementError {
+    SubscriptionNotFound,
+    PolicyNotFound,
+    Unauthorized,
+    InvalidSubscriptionData,
+    InsufficientFunds,
+    SubscriptionNotActive,
+    PaymentFailed,
+    InvalidPolicy,
+}
+
+pub fn create_subscription(
+    env: &Env,
+    subscriber: Address,
+    policy_id: u64,
+    start_date: u64,
+    premium_amount: i128,
+) -> Result<u64, SubscriptionManagementError> {
+    
+    if !is_user_approved(env, &subscriber) {
+        return Err(SubscriptionManagementError::Unauthorized);
     }
 
-    // Check if plan is available for subscription
-    if !is_plan_available_for_subscription(env, plan_id) {
-        return false;
+    
+    let policy = env.storage().instance().get::<_, Policy>(&DataKey::Policy(policy_id))
+        .ok_or(SubscriptionManagementError::InvalidPolicy)?;
+
+    if policy.status != crate::state::PolicyStatus::Active {
+        return Err(SubscriptionManagementError::InvalidPolicy);
     }
 
-    // Check if user already has an active subscription
-    if has_active_subscription(env, &user) {
-        return false;
+    
+    if start_date < env.ledger().timestamp() {
+        return Err(SubscriptionManagementError::InvalidSubscriptionData);
     }
 
-    let mut subscriptions: Map<u64, Subscription> = env.storage().instance().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    let subscription_id = subscriptions.len() as u64 + 1;
+    
+    if premium_amount <= 0 {
+        return Err(SubscriptionManagementError::InvalidSubscriptionData);
+    }
 
-    let new_subscription = Subscription {
+    let subscription_id = env.ledger().sequence() as u64;
+    let subscription = Subscription {
         id: subscription_id,
-        user: user.clone(),
-        plan_id,
-        start_date: env.ledger().timestamp(),
+        policy_id,
+        subscriber: subscriber.clone(),
+        start_date,
         status: SubscriptionStatus::Active,
-        weeks_paid: 0,
-        weeks_due: 1, // Start with 1 week due
         last_payment_date: 0,
-        grace_period_end: 0,
+        next_payment_due: start_date + (7 * 24 * 60 * 60), 
+        weeks_paid: 0,
+        weeks_due: 1,
+        grace_period_end: start_date + (14 * 24 * 60 * 60), 
         total_premiums_paid: 0,
     };
 
-    subscriptions.set(subscription_id, new_subscription);
-    env.storage().instance().set(&SUBSCRIPTIONS, &subscriptions);
+    env.storage().instance().set(&DataKey::Subscription(subscription_id), &subscription);
+    
+    env.events().publish(
+        (EVENT_SUB_CRT, subscription_id),
+        (subscriber, policy_id, premium_amount)
+    );
 
-    // Update user's subscribed plan
-    let mut users: Map<Address, User> = env.storage().instance().get(&USERS).unwrap_or_else(|| Map::new(env));
-    if let Some(mut user_data) = users.get(user.clone()) {
-        user_data.subscribed_plan = Some(plan_id);
-        users.set(user.clone(), user_data);
-        env.storage().instance().set(&USERS, &users);
-    }
-
-    // Increment plan subscriber count
-    increment_plan_subscriber_count(env, plan_id);
-
-    env.events().publish((PLAN_SUBSCRIBED, user.clone()), plan_id);
-    true
+    Ok(subscription_id)
 }
 
-pub fn pay_premium(env: &Env, user: Address) -> bool {
-    let subscription = match get_active_subscription_for_user(env, &user) {
-        Some(sub) => sub,
-        None => return false,
-    };
+pub fn update_subscription(
+    env: &Env,
+    subscription_id: u64,
+    updater: Address,
+    new_start_date: Option<u64>,
+) -> Result<bool, SubscriptionManagementError> {
+    let subscription_key = DataKey::Subscription(subscription_id);
+    let mut subscription = env.storage().instance().get::<_, Subscription>(&subscription_key)
+        .ok_or(SubscriptionManagementError::SubscriptionNotFound)?;
 
-    let plan = match get_plan(env, subscription.plan_id) {
-        Some(p) => p,
-        None => return false,
-    };
-
-    let mut subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    let mut subscription = subscription;
-
-    // Calculate penalty if payment is late
-    let mut penalty = 0i128;
-    let current_time = env.ledger().timestamp();
-    let config = get_platform_config(env);
     
-    if subscription.weeks_due > subscription.weeks_paid + 1 {
-        penalty = (plan.weekly_premium * config.penalty_rate as i128) / 10000; // Basis points
+    if subscription.subscriber != updater && !is_user_approved(env, &updater) {
+        return Err(SubscriptionManagementError::Unauthorized);
     }
 
-    let total_payment = plan.weekly_premium + penalty;
+    
+    if subscription.status != SubscriptionStatus::Active {
+        return Err(SubscriptionManagementError::SubscriptionNotActive);
+    }
 
-    // Update subscription
+    
+    if let Some(date) = new_start_date {
+        if date > env.ledger().timestamp() {
+            subscription.start_date = date;
+            subscription.next_payment_due = date + (7 * 24 * 60 * 60);
+            subscription.grace_period_end = date + (14 * 24 * 60 * 60);
+        }
+    }
+
+    env.storage().instance().set(&subscription_key, &subscription);
+
+    env.events().publish(
+        (EVENT_SUB_CRT, subscription_id),
+        (updater, "subscription updated")
+    );
+
+    Ok(true)
+}
+
+pub fn cancel_subscription(
+    env: &Env,
+    subscription_id: u64,
+    canceller: Address,
+) -> Result<bool, SubscriptionManagementError> {
+    let subscription_key = DataKey::Subscription(subscription_id);
+    let mut subscription = env.storage().instance().get::<_, Subscription>(&subscription_key)
+        .ok_or(SubscriptionManagementError::SubscriptionNotFound)?;
+
+    
+    if subscription.subscriber != canceller && !is_user_approved(env, &canceller) {
+        return Err(SubscriptionManagementError::Unauthorized);
+    }
+
+    
+    if subscription.status != SubscriptionStatus::Active {
+        return Err(SubscriptionManagementError::SubscriptionNotActive);
+    }
+
+    subscription.status = SubscriptionStatus::Cancelled;
+    env.storage().instance().set(&subscription_key, &subscription);
+
+    env.events().publish(
+        (EVENT_SUB_SUS, subscription_id),
+        (canceller, "subscription cancelled")
+    );
+
+    Ok(true)
+}
+
+pub fn process_payment(
+    env: &Env,
+    subscription_id: u64,
+    payer: Address,
+    amount: i128,
+) -> Result<bool, SubscriptionManagementError> {
+    let subscription_key = DataKey::Subscription(subscription_id);
+    let mut subscription = env.storage().instance().get::<_, Subscription>(&subscription_key)
+        .ok_or(SubscriptionManagementError::SubscriptionNotFound)?;
+
+    
+    if subscription.subscriber != payer {
+        return Err(SubscriptionManagementError::Unauthorized);
+    }
+
+    
+    if subscription.status != SubscriptionStatus::Active {
+        return Err(SubscriptionManagementError::SubscriptionNotActive);
+    }
+
+    
+    subscription.last_payment_date = env.ledger().timestamp();
     subscription.weeks_paid += 1;
-    subscription.last_payment_date = current_time;
-    subscription.total_premiums_paid += total_payment;
+    subscription.total_premiums_paid += amount;
     
-    // Reset grace period if in grace period
-    if subscription.status == SubscriptionStatus::GracePeriod {
-        subscription.status = SubscriptionStatus::Active;
-        subscription.grace_period_end = 0;
-    }
+    
+    subscription.next_payment_due = subscription.next_payment_due + (7 * 24 * 60 * 60);
 
-    record_payment(env, user.clone(), subscription.plan_id, total_payment, subscription.weeks_paid, penalty);
+    env.storage().instance().set(&subscription_key, &subscription);
 
-    subscriptions.set(subscription.id, subscription);
-    env.storage().persistent().set(&SUBSCRIPTIONS, &subscriptions);
+    env.events().publish(
+        (EVENT_SUB_PAY, subscription_id),
+        (payer, amount, "payment processed")
+    );
 
-    // Update safety pool
-    update_safety_pool_with_premium(env, total_payment);
-
-    env.events().publish((PREMIUM_PAID, user), total_payment);
-    true
+    Ok(true)
 }
 
-pub fn cancel_subscription(env: &Env, user: Address) -> bool {
-    let subscription = match get_active_subscription_for_user(env, &user) {
-        Some(sub) => sub,
-        None => return false,
-    };
+pub fn renew_subscription(
+    env: &Env,
+    subscription_id: u64,
+    renewer: Address,
+    new_start_date: u64,
+) -> Result<bool, SubscriptionManagementError> {
+    let subscription_key = DataKey::Subscription(subscription_id);
+    let mut subscription = env.storage().instance().get::<_, Subscription>(&subscription_key)
+        .ok_or(SubscriptionManagementError::SubscriptionNotFound)?;
 
-    let mut subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    let mut subscription_mut = subscription.clone();
-
-    subscription_mut.status = SubscriptionStatus::Cancelled;
-    subscriptions.set(subscription_mut.id, subscription_mut.clone());
-    env.storage().persistent().set(&SUBSCRIPTIONS, &subscriptions);
-
-    // Update user's subscribed plan
-    let mut users: Map<Address, User> = env.storage().persistent().get(&USERS).unwrap_or_else(|| Map::new(env));
-    if let Some(mut user_data) = users.get(user.clone()) {
-        user_data.subscribed_plan = None;
-        users.set(user.clone(), user_data);
-        env.storage().persistent().set(&USERS, &users);
+    
+    if subscription.subscriber != renewer {
+        return Err(SubscriptionManagementError::Unauthorized);
     }
 
-    // Decrement plan subscriber count
-    decrement_plan_subscriber_count(env, subscription_mut.plan_id);
+    
+    if subscription.status != SubscriptionStatus::Active {
+        return Err(SubscriptionManagementError::SubscriptionNotActive);
+    }
 
-    env.events().publish((SUBSCRIPTION_CANCELLED, user), subscription_mut.plan_id);
-    true
+    
+    subscription.start_date = new_start_date;
+    subscription.next_payment_due = new_start_date + (7 * 24 * 60 * 60);
+    subscription.grace_period_end = new_start_date + (14 * 24 * 60 * 60);
+    
+    env.storage().instance().set(&subscription_key, &subscription);
+
+    env.events().publish(
+        (EVENT_SUB_CRT, subscription_id),
+        (renewer, "subscription renewed")
+    );
+
+    Ok(true)
 }
 
-pub fn reactivate_subscription(env: &Env, user: Address) -> bool {
-    // Check if user is approved
-    if !is_user_approved(env, &user) {
-        return false;
-    }
+pub fn get_subscription(env: &Env, subscription_id: u64) -> Result<Subscription, SubscriptionManagementError> {
+    env.storage().instance().get(&DataKey::Subscription(subscription_id))
+        .ok_or(SubscriptionManagementError::SubscriptionNotFound)
+}
 
-    let subscription = match get_subscription_for_user(env, &user) {
-        Some(sub) => sub,
-        None => return false,
-    };
+pub fn get_user_subscriptions(env: &Env, user: Address) -> Result<Vec<u64>, SubscriptionManagementError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    //TODO: Implement this
+    Ok(Vec::new(&env))
+}
 
-    // Can only reactivate suspended subscriptions
-    if subscription.status != SubscriptionStatus::Suspended {
-        return false;
-    }
+pub fn get_active_subscriptions(env: &Env) -> Result<Vec<u64>, SubscriptionManagementError> {
+    // This is a simplified implementation - in a real contract you might want to maintain an index
+    // For now, we'll return an empty vector as this would require more complex storage patterns
+    //TODO: Implement this
+    Ok(Vec::new(&env))
+}
 
-    let plan = match get_plan(env, subscription.plan_id) {
+pub fn calculate_premium(
+    env: &Env,
+    policy_id: u64,
+    coverage_amount: i128,
+    duration_days: u32,
+    risk_score: u32,
+) -> i128 {
+    let policy = match env.storage().instance().get::<_, Policy>(&DataKey::Policy(policy_id)) {
         Some(p) => p,
-        None => return false,
+        None => return 0,
     };
 
-    let mut subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    let mut subscription_mut = subscription.clone();
+    let base_rate = policy.params.interest_rate;
+    let risk_multiplier = 100 + (risk_score as i128 * 2); 
+    let duration_multiplier = (duration_days as i128 * 100) / 365; 
 
-    // Calculate outstanding payments
-    let weeks_outstanding = subscription_mut.weeks_due.saturating_sub(subscription_mut.weeks_paid);
-    let config = get_platform_config(env);
-    let penalty_rate = config.penalty_rate as i128;
-
-    let outstanding_amount = weeks_outstanding as i128 * plan.weekly_premium;
-    let penalty = (outstanding_amount * penalty_rate) / 10000;
-    let total_reactivation_cost = outstanding_amount + penalty;
-
-    // For now, we'll assume payment is made (in real implementation, this would be integrated with payment)
-    subscription_mut.status = SubscriptionStatus::Active;
-    subscription_mut.weeks_paid = subscription_mut.weeks_due;
-    subscription_mut.last_payment_date = env.ledger().timestamp();
-    subscription_mut.total_premiums_paid += total_reactivation_cost;
-    subscription_mut.grace_period_end = 0;
-
-    subscriptions.set(subscription_mut.id, subscription_mut.clone());
-    env.storage().persistent().set(&SUBSCRIPTIONS, &subscriptions);
-
-    // Update user's subscribed plan
-    let mut users: Map<Address, User> = env.storage().persistent().get(&USERS).unwrap_or_else(|| Map::new(env));
-    if let Some(mut user_data) = users.get(user.clone()) {
-        user_data.subscribed_plan = Some(subscription_mut.plan_id);
-        users.set(user.clone(), user_data);
-        env.storage().persistent().set(&USERS, &users);
-    }
-
-    // Increment plan subscriber count
-    increment_plan_subscriber_count(env, subscription_mut.plan_id);
-
-    // Record reactivation payment
-    record_payment(env, user.clone(), subscription_mut.plan_id, total_reactivation_cost, subscription_mut.weeks_paid, penalty);
-
-    // Update safety pool
-    update_safety_pool_with_premium(env, total_reactivation_cost);
-
-    env.events().publish((SUBSCRIPTION_REACTIVATED, user), total_reactivation_cost);
-    true
+    (coverage_amount * base_rate as i128 * risk_multiplier * duration_multiplier) / (100 * 100 * 100)
 }
 
-pub fn update_subscription_status(env: &Env) {
-    // This function should be called periodically to update subscription statuses
-    let mut subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    let current_time = env.ledger().timestamp();
-    let config = get_platform_config(env);
-    let grace_period_seconds = config.grace_period_weeks * 7 * 24 * 60 * 60;
-
-    let mut any_updated = false;
-
-    for (sub_id, mut subscription) in subscriptions.iter() {
-        let mut updated = false;
-        if subscription.status == SubscriptionStatus::Active {
-            // Check if payment is overdue
-            let weeks_since_start = (current_time - subscription.start_date) / (7 * 24 * 60 * 60);
-            subscription.weeks_due = weeks_since_start + 1;
-
-            if subscription.weeks_due > subscription.weeks_paid {
-                // Payment is overdue, start grace period
-                subscription.status = SubscriptionStatus::GracePeriod;
-                subscription.grace_period_end = current_time + grace_period_seconds;
-                updated = true;
-
-                env.events().publish((SUBSCRIPTION_GRACE_PERIOD, subscription.user.clone()), sub_id);
-            }
-        } else if subscription.status == SubscriptionStatus::GracePeriod {
-            // Check if grace period has expired
-            if current_time > subscription.grace_period_end {
-                subscription.status = SubscriptionStatus::Suspended;
-                updated = true;
-
-                env.events().publish((SUBSCRIPTION_SUSPENDED, subscription.user.clone()), sub_id);
-            }
-        }
-
-        if updated {
-            subscriptions.set(sub_id, subscription);
-            any_updated = true;
-        }
-    }
-
-    if any_updated {
-        env.storage().persistent().set(&SUBSCRIPTIONS, &subscriptions);
-    }
-}
-
-pub fn get_subscription_for_user(env: &Env, user: &Address) -> Option<Subscription> {
-    let subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
+pub fn validate_subscription_eligibility(
+    env: &Env,
+    user: Address,
+    policy_id: u64,
+) -> Result<bool, SubscriptionManagementError> {
     
-    for (_, subscription) in subscriptions.iter() {
-        if subscription.user == user.clone() {
-            return Some(subscription);
-        }
+    if !is_user_approved(env, &user) {
+        return Err(SubscriptionManagementError::Unauthorized);
     }
-    None
-}
 
-pub fn get_active_subscription_for_user(env: &Env, user: &Address) -> Option<Subscription> {
-    if let Some(subscription) = get_subscription_for_user(env, user) {
-        match subscription.status {
-            SubscriptionStatus::Active | SubscriptionStatus::GracePeriod => Some(subscription),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-pub fn has_active_subscription(env: &Env, user: &Address) -> bool {
-    get_active_subscription_for_user(env, user).is_some()
-}
-
-pub fn get_subscription_by_id(env: &Env, subscription_id: u64) -> Option<Subscription> {
-    let subscriptions: Map<u64, Subscription> = env.storage().persistent().get(&SUBSCRIPTIONS).unwrap_or_else(|| Map::new(env));
-    subscriptions.get(subscription_id)
-}
-
-fn record_payment(env: &Env, user: Address, plan_id: u64, amount: i128, week_number: u64, penalty: i128) {
-    let mut payments: Map<Address, Vec<Payment>> = env.storage().persistent().get(&PAYMENTS).unwrap_or_else(|| Map::new(env));
-    let mut user_payments = payments.get(user.clone()).unwrap_or(Vec::new(env));
-
-    let payment = Payment {
-        user: user.clone(),
-        plan_id,
-        amount,
-        week_number,
-        payment_date: env.ledger().timestamp(),
-        penalty_applied: penalty,
-    };
-
-    user_payments.push_back(payment);
-    payments.set(user, user_payments);
-    env.storage().persistent().set(&PAYMENTS, &payments);
-}
-
-fn update_safety_pool_with_premium(env: &Env, premium_amount: i128) {
-    use crate::state::SafetyPool;
     
-    let mut safety_pool: SafetyPool = env.storage().persistent().get(&SAFETY_POOL).unwrap_or(SafetyPool {
-        total_balance: 0,
-        premium_contributions: 0,
-        claim_payouts: 0,
-        investment_returns: 0,
-        reserve_ratio: DEFAULT_RESERVE_RATIO,
-        last_audit_date: env.ledger().timestamp(),
-        minimum_reserve: DEFAULT_MINIMUM_RESERVE,
-    });
+    let policy = env.storage().instance().get::<_, Policy>(&DataKey::Policy(policy_id))
+        .ok_or(SubscriptionManagementError::InvalidPolicy)?;
 
-    safety_pool.total_balance += premium_amount;
-    safety_pool.premium_contributions += premium_amount;
-
-    env.storage().persistent().set(&SAFETY_POOL, &safety_pool);
-}
-
-fn get_platform_config(env: &Env) -> PlatformConfig {
-    env.storage().persistent().get(&PLATFORM_CONFIG).unwrap_or(PlatformConfig {
-        grace_period_weeks: DEFAULT_GRACE_PERIOD_WEEKS,
-        minimum_quorum: DEFAULT_MINIMUM_QUORUM,
-        proposal_duration_days: DEFAULT_PROPOSAL_DURATION_DAYS,
-        max_claim_amount_ratio: DEFAULT_MAX_CLAIM_AMOUNT_RATIO,
-        penalty_rate: DEFAULT_PENALTY_RATE,
-        council_size: DEFAULT_COUNCIL_SIZE,
-    })
-}
-
-pub fn get_user_payment_history(env: &Env, user: &Address) -> Vec<Payment> {
-    let payments: Map<Address, Vec<Payment>> = env.storage().persistent().get(&PAYMENTS).unwrap_or_else(|| Map::new(env));
-    payments.get(user.clone()).unwrap_or(Vec::new(env))
-}
-
-pub fn calculate_outstanding_premium(env: &Env, user: &Address) -> i128 {
-    if let Some(subscription) = get_active_subscription_for_user(env, user) {
-        if let Some(plan) = get_plan(env, subscription.plan_id) {
-            let weeks_outstanding = subscription.weeks_due.saturating_sub(subscription.weeks_paid);
-            return weeks_outstanding as i128 * plan.weekly_premium;
-        }
+    if policy.status != crate::state::PolicyStatus::Active {
+        return Err(SubscriptionManagementError::InvalidPolicy);
     }
-    0
+
+    // Check if user already has an active subscription for this policy
+    //TODO: Implement this  
+    // This would require maintaining an index in a real implementation
+    
+    Ok(true)
+}
+
+
+pub fn is_in_grace_period(env: &Env, subscription: &Subscription) -> bool {
+    env.ledger().timestamp() <= subscription.grace_period_end
+}
+
+
+pub fn can_renew_subscription(env: &Env, subscription: &Subscription) -> bool {
+    subscription.status == SubscriptionStatus::Active && 
+    env.ledger().timestamp() >= subscription.start_date - (30 * 24 * 60 * 60) 
+}
+
+
+pub fn is_payment_overdue(env: &Env, subscription: &Subscription) -> bool {
+    env.ledger().timestamp() > subscription.next_payment_due + (7 * 24 * 60 * 60) 
 }
